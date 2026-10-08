@@ -1,6 +1,7 @@
 """Pan/tilt/zoom sliders and one-click presets for UVC cameras (DirectShow IAMCameraControl)."""
 import json
 import sys
+import time
 import tkinter as tk
 from ctypes import POINTER, byref, c_long, c_ulong
 from pathlib import Path
@@ -16,7 +17,12 @@ CAMERA_NAME_FILTER = "Yealink"  # only cameras whose name contains this
 PRESETS_FILE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).with_name("presets.json")
 PROPS = {"Pan": 0, "Tilt": 1, "Zoom": 3}  # CameraControl_* enum
 FLAG_MANUAL = 2
-STEP = {0: 1, 1: 1, 3: 5}  # keyboard step per press for pan, tilt, zoom; flip signs in App bindings if a direction is inverted
+# keyboard step per press for pan, tilt, zoom; UVC34 pan/tilt only land on ~every 2nd value, so 1 gives dead presses.
+# Flip signs in App bindings if a direction is inverted.
+STEP = {0: 2, 1: 2, 3: 5}
+POLL_MS = 100
+SETTLE_S = 0.8       # a move whose position hasn't changed for this long is done
+MOVE_TIMEOUT_S = 8   # full pan sweep at max zoom takes ~5s
 IDLE_BG, HOVER_BG = "#e8e8e8", "#b8d8ff"
 
 
@@ -104,6 +110,9 @@ class App(tk.Tk):
         self.ranges = []  # per camera: {prop: (min, max)}
         self.presets = load_presets()
         self.hovered = None  # camera index under the mouse in the keyboard tab
+        self.pending = [{} for _ in cams]  # per camera: {prop: target} waiting to be sent, in order
+        self.moving = [None] * len(cams)   # per camera: the one move in progress
+        self.after(POLL_MS, self.pump)
 
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill="both", expand=True, padx=6, pady=6)
@@ -122,7 +131,7 @@ class App(tk.Tk):
                 var = tk.IntVar(value=ctl.Get(prop)[0])
                 tk.Label(frame, text=label).grid(row=r, column=0, sticky="w")
                 tk.Scale(frame, from_=lo, to=hi, resolution=max(step, 1), orient="horizontal", length=260,
-                         variable=var, command=lambda v, c=ctl, p=prop: c.Set(p, int(float(v)), FLAG_MANUAL)
+                         variable=var, command=lambda v, i=i, p=prop: self.set_prop(i, p, int(float(v)))
                          ).grid(row=r, column=1)
                 cam_vars[prop], cam_ranges[prop] = var, (lo, hi)
             self.vars.append(cam_vars)
@@ -131,7 +140,8 @@ class App(tk.Tk):
             pane = tk.Label(keys, text=letter, font=("Segoe UI", 64, "bold"), width=4, height=2,
                             bg=IDLE_BG, relief="ridge", bd=2)
             pane.grid(row=0, column=i, padx=6, pady=6, sticky="nsew")
-            pane.bind("<Enter>", lambda e, i=i, w=pane: (setattr(self, "hovered", i), w.config(bg=HOVER_BG), w.focus_set()))
+            pane.bind("<Enter>", lambda e, i=i, w=pane: (setattr(self, "hovered", i), w.config(bg=HOVER_BG), w.focus_set(),
+                                                         self.resync(i)))
             pane.bind("<Leave>", lambda e, w=pane: (setattr(self, "hovered", None), w.config(bg=IDLE_BG)))
         tk.Label(keys, text="Hover a camera, then: arrows = pan/tilt, Ctrl+Up/Down = zoom", fg="gray"
                  ).grid(row=1, column=0, columnspan=max(len(cams), 1))
@@ -153,12 +163,16 @@ class App(tk.Tk):
         if self.hovered is None or self.tabs.index("current") != 1:
             return
         i = self.hovered
-        ctl = self.cams[i][2]
         lo, hi = self.ranges[i][prop]
-        # read the camera, not the slider: the camera can move pan/tilt itself (e.g. while zooming)
-        value = min(hi, max(lo, ctl.Get(prop)[0] + sign * STEP[prop]))
-        ctl.Set(prop, value, FLAG_MANUAL)
-        self.vars[i][prop].set(value)
+        # step from our own target, not ctl.Get(): the camera reports its position late, so presses would stall
+        self.set_prop(i, prop, min(hi, max(lo, self.vars[i][prop].get() + sign * STEP[prop])))
+
+    def resync(self, i):
+        """Pull real positions into the sliders; the camera can move pan/tilt itself (e.g. while zooming)."""
+        if self.moving[i] or self.pending[i]:  # mid-move, our targets are the truth
+            return
+        for prop, var in self.vars[i].items():
+            var.set(self.cams[i][2].Get(prop)[0])
 
     def save_preset(self):
         name = simpledialog.askstring("Save preset", "Preset name:", parent=self)
@@ -168,23 +182,46 @@ class App(tk.Tk):
         self.write_presets()
 
     def apply_preset(self, name):
-        for i, (_, path, ctl) in enumerate(self.cams):
-            target = {int(p): v for p, v in self.presets[name].get(path, {}).items()}  # cameras not in preset are left alone
-            zoom = PROPS["Zoom"]
-            if zoom in target:
-                self.set_prop(i, zoom, target.pop(zoom))
-            # zoom moves gradually; pan/tilt sent mid-zoom get overridden, so wait for it to arrive
-            self.after_zoom(i, ctl, lambda i=i, t=target: [self.set_prop(i, p, v) for p, v in t.items()])
-
-    def after_zoom(self, i, ctl, then, tries=40):
-        if tries and ctl.Get(PROPS["Zoom"])[0] != self.vars[i][PROPS["Zoom"]].get():
-            self.after(100, self.after_zoom, i, ctl, then, tries - 1)  # ponytail: 4s cap, raise if big zooms take longer
-        else:
-            then()
+        for i, (_, path, _) in enumerate(self.cams):
+            target = self.presets[name].get(path)  # cameras not in preset are left alone
+            if target:
+                # zoom first: zooming drags pan/tilt toward centre, so they must come after it
+                self.pending[i] = {p: target[str(p)] for p in (PROPS["Zoom"], PROPS["Pan"], PROPS["Tilt"])}
+                for p, v in self.pending[i].items():
+                    self.vars[i][p].set(v)
 
     def set_prop(self, i, prop, value):
-        self.cams[i][2].Set(prop, value, FLAG_MANUAL)
+        """Queue a move. The UVC34 runs one move at a time: any new command freezes a move on another axis."""
         self.vars[i][prop].set(value)
+        moving = self.moving[i]
+        if moving and moving["prop"] == prop:  # retargeting the axis in motion is safe
+            self.cams[i][2].Set(prop, value, FLAG_MANUAL)
+            moving["target"] = value
+        else:
+            self.pending[i].pop(prop, None)  # re-insert so the latest request goes last
+            self.pending[i][prop] = value
+
+    def pump(self):
+        now = time.monotonic()
+        for i, (_, _, ctl) in enumerate(self.cams):
+            m = self.moving[i]
+            if m:
+                value = ctl.Get(m["prop"])[0]
+                if value != m["last"]:
+                    m["last"], m["since"] = value, now
+                # positions are quantised (asking for 2 may land on 1), so "stopped changing" also counts as arrived
+                if value == m["target"] or now - m["since"] > SETTLE_S or now - m["start"] > MOVE_TIMEOUT_S:
+                    self.moving[i] = None
+                    if m["prop"] == PROPS["Zoom"]:  # zoom drags pan/tilt; show where they really ended up
+                        for p in (PROPS["Pan"], PROPS["Tilt"]):
+                            if p not in self.pending[i]:
+                                self.vars[i][p].set(ctl.Get(p)[0])
+            if not self.moving[i] and self.pending[i]:
+                prop = next(iter(self.pending[i]))
+                value = self.pending[i].pop(prop)
+                ctl.Set(prop, value, FLAG_MANUAL)
+                self.moving[i] = {"prop": prop, "target": value, "last": None, "since": now, "start": now}
+        self.after(POLL_MS, self.pump)
 
     def delete_preset(self, name):
         del self.presets[name]
