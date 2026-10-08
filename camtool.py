@@ -71,7 +71,13 @@ class IAMCameraControl(IUnknown):
     ]
 
 
-CLSID_SystemDeviceEnum = GUID("{62BE5D10-60EB-11d0-BD3B-00A0C911CE86}")
+class IAMVideoProcAmp(IAMCameraControl):  # same method layout, different interface
+    _iid_ = GUID("{C6E13360-30AC-11d0-A18C-00A0C9118956}")
+
+
+VIDEOPROCAMP_BRIGHTNESS = 0
+
+CLSID_SystemDeviceEnum =GUID("{62BE5D10-60EB-11d0-BD3B-00A0C911CE86}")
 CLSID_VideoInputDeviceCategory = GUID("{860BB310-5D01-11d0-BD3B-00A0C911CE86}")
 
 
@@ -137,14 +143,25 @@ class App(tk.Tk):
             self.vars.append(cam_vars)
             self.ranges.append(cam_ranges)
 
+            # brightness is instant (no motor), so it skips the move queue; both tabs share one variable
+            amp = ctl.QueryInterface(IAMVideoProcAmp)
+            lo, hi, step, _default, _caps = amp.GetRange(VIDEOPROCAMP_BRIGHTNESS)
+            bright = tk.IntVar(value=amp.Get(VIDEOPROCAMP_BRIGHTNESS)[0])
+            set_bright = lambda v, a=amp: a.Set(VIDEOPROCAMP_BRIGHTNESS, int(float(v)), FLAG_MANUAL)
+            tk.Label(frame, text="Brightness").grid(row=len(PROPS), column=0, sticky="w")
+            tk.Scale(frame, from_=lo, to=hi, resolution=max(step, 1), orient="horizontal", length=260,
+                     variable=bright, command=set_bright).grid(row=len(PROPS), column=1)
+
             pane = tk.Label(keys, text=letter, font=("Segoe UI", 64, "bold"), width=4, height=2,
                             bg=IDLE_BG, relief="ridge", bd=2)
             pane.grid(row=0, column=i, padx=6, pady=6, sticky="nsew")
+            tk.Scale(keys, label="Brightness", from_=lo, to=hi, resolution=max(step, 1), orient="horizontal",
+                     variable=bright, command=set_bright).grid(row=1, column=i, padx=6, sticky="we")
             pane.bind("<Enter>", lambda e, i=i, w=pane: (setattr(self, "hovered", i), w.config(bg=HOVER_BG), w.focus_set(),
                                                          self.resync(i)))
             pane.bind("<Leave>", lambda e, w=pane: (setattr(self, "hovered", None), w.config(bg=IDLE_BG)))
         tk.Label(keys, text="Hover a camera, then: arrows = pan/tilt, Ctrl+Up/Down = zoom", fg="gray"
-                 ).grid(row=1, column=0, columnspan=max(len(cams), 1))
+                 ).grid(row=2, column=0, columnspan=max(len(cams), 1))
 
         for key, prop, sign in (("Left", PROPS["Pan"], -1), ("Right", PROPS["Pan"], 1),
                                 ("Up", PROPS["Tilt"], -1), ("Down", PROPS["Tilt"], 1),
